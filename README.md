@@ -27,3 +27,4 @@ $min  = (new Waiwaisew/JsMinifier())->minify($javascript_text, false);
 ## Others
 1. This package is generated using Claude AI.
 2. The code will be improved base on what creator face time by time.
+3. Licence: MIT
