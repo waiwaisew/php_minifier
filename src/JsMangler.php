@@ -4,6 +4,10 @@ namespace Waiwaisew\Minifier;
  * PART 2 – VARIABLE MANGLER
  * Renames local variables and parameters inside every function body.
  * ============================================================================= */
+/* =============================================================================
+ * PART 2 – VARIABLE MANGLER
+ * Renames local variables and parameters inside every function body.
+ * ============================================================================= */
 class JsMangler
 {
     // JS keywords — never usable as variable names

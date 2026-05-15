@@ -1,23 +1,6 @@
 <?php
 namespace Waiwaisew\Minifier;
  
-   
-/* =============================================================================
- * JavaScript Minifier + Variable Mangler
- *
- * Usage (string):
- *   $min  = (new JsMinifier())->minify($code);
- *   $out  = (new JsMangler())->mangle($min);
- *
- * Usage (file):
- *   $out  = (new JsMinifier())->minifyFile('app.js');
- *   $out  = (new JsMangler())->mangle($out);
- * ============================================================================= */
-
-
-/* =============================================================================
- * PART 1 – MINIFIER
- * ============================================================================= */
 class JsMinifier
 {
     private string $input  = '';
@@ -128,6 +111,10 @@ class JsMinifier
         // `}`) has nothing to attach to — strip it and its matching `}` entirely.
         if ($lastChar === ';') return 'orphan';
         if ($lastChar === '}' && $this->lastPoppedBrace !== 'object') return 'orphan';
+        // `{` directly after another block-opening `{` means we are at
+        // statement-start inside a code block (e.g. `function foo(){ { ... } }`).
+        // Guard with braceStack so we never misfire inside an object literal.
+        if ($lastChar === '{' && !empty($this->braceStack) && end($this->braceStack) !== 'object') return 'orphan';
 
         // Arrow function body: `=> {` is a code block, but its closing `}` still needs a
         // semicolon because arrow functions are always expressions (`const f = () => {...};`).
@@ -191,6 +178,10 @@ class JsMinifier
 
         if ($lastChar === ')' && $this->closesControlFlow($out)) { $this->output = $out; return; }
 
+        // After a regular call foo(...), a { on the next line is an orphan block;
+        // inject ; so detectBraceType() can strip it correctly as 'orphan'.
+        if ($lastChar === ')' && $next === '{') { $this->output = $out . ';'; return; }
+
         if ($next !== '' && in_array($next, ['.','?',':','(',',',')',']','{','}'], true)) { $this->output = $out; return; }
 
         $n2 = substr($this->input, $this->pos, 2);
@@ -222,7 +213,14 @@ class JsMinifier
             elseif ($c === '(') { $depth--; if ($depth === 0) break; }
             $i--;
         }
-        return in_array($this->lastWord(rtrim(substr($out, 0, $i))), self::CONTROL_FLOW_KEYWORDS, true);
+        $prefix = rtrim(substr($out, 0, $i));
+        $lastW  = $this->lastWord($prefix);
+        if (in_array($lastW, self::CONTROL_FLOW_KEYWORDS, true)) return true;
+        // Named function declaration: `function name(` or `async function name(`
+        $beforeName = rtrim(preg_replace('/[a-zA-Z_$][\w$]*\s*$/', '', $prefix));
+        $prevW = $this->lastWord($beforeName);
+        if (in_array($prevW, ['function', 'async'], true)) return true;
+        return false;
     }
 
     // ---- string / template readers ----
@@ -395,32 +393,3 @@ class JsMinifier
     private function lastWord(string $str): string
     { return preg_match('/([a-zA-Z_$][a-zA-Z0-9_$]*)$/',rtrim($str),$m)?$m[1]:''; }
 }
-
-
-
-
-/* =============================================================================
- * CLI entry point
- * ============================================================================= */
-// if (php_sapi_name() === 'cli') {
-//     if (!isset($argv[1]) || !file_exists($argv[1])) {
-//         echo "Usage: php js_minifier.php input.js\n";
-//         echo "       php js_minifier.php input.js --no-mangle\n";
-//         exit(1);
-//     }
-
-//     $mangle   = !in_array('--no-mangle', $argv);
-//     $src      = file_get_contents($argv[1]);
-//     $minifier = new JsMinifier();
-//     $output   = $minifier->minify($src, $mangle);
-
-//     $outPath = preg_replace('/\.js$/', '.min.js', $argv[1]);
-//     if ($outPath === $argv[1]) $outPath .= '.min.js';
-
-//     file_put_contents($outPath, $output);
-
-//     printf("Original  : %d bytes\n", strlen($src));
-//     printf("Output    : %d bytes\n", strlen($output));
-//     printf("Saved     : %.1f%%\n",   (1 - strlen($output)/strlen($src))*100);
-//     echo   "Written   : $outPath\n";
-// }
