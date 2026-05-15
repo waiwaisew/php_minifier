@@ -3,7 +3,7 @@ Run command below to install:
 ```bash
 composer require waiwaisew/minifier
 ```
-Run code into file by "require"/"inclide" etc.:
+Run code into file by "require"/"include" etc.:
 ```php
 <?php 
 require '/your_folder_name/vendor/autoload.php';
