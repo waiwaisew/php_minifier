@@ -3,10 +3,10 @@ Run command below to install
 composer require waiwaisew/minifier
 
 # How to use
-General
+##General
 $min  = (new Waiwaisew/JsMinifier())->minify($javascript_text);
 
-Minify without mangle:
+##Minify without mangle:
 $min  = (new Waiwaisew/JsMinifier())->minify($javascript_text, false);
 
 # Note
