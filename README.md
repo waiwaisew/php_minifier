@@ -1,6 +1,8 @@
 # Installing
 Run command below to install:
+```bash
 composer require waiwaisew/minifier
+```
 
 # How to use
 **General**<br>
