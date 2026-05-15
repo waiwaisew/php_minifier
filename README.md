@@ -2,7 +2,7 @@
 1. This is PHP minifier code that only minify for JavaScript at this time.
 2. The code works even if JavaScript is hybrid with jQuery. 
 
-# Installing
+## Installing
 Run command below to install:
 ```bash
 composer require waiwaisew/minifier
@@ -14,7 +14,7 @@ require '/your_folder_name/vendor/autoload.php';
 ```
 
 
-# How to use
+## How to use
 **General**<br>
 ```php
 $min  = (new Waiwaisew/JsMinifier())->minify($javascript_text);
@@ -24,6 +24,6 @@ $min  = (new Waiwaisew/JsMinifier())->minify($javascript_text);
 $min  = (new Waiwaisew/JsMinifier())->minify($javascript_text, false);
 ```
 
-# Others
+## Others
 1. This package is generated using Claude AI.
 2. The code will be improved base on what creator face time by time.
