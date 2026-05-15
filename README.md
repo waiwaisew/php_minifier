@@ -1,5 +1,5 @@
 # Installing
-Run command below to install
+Run command below to install:
 composer require waiwaisew/minifier
 
 # How to use
