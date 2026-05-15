@@ -4,10 +4,13 @@ composer require waiwaisew/minifier
 
 # How to use
 **General**<br>
+```php
 $min  = (new Waiwaisew/JsMinifier())->minify($javascript_text);
-
+```
 **Minify without mangle:**<br>
+```php
 $min  = (new Waiwaisew/JsMinifier())->minify($javascript_text, false);
+```
 
 # Note
 1. The minifier is only working for JavaScript and jQuery.
