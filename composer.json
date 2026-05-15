@@ -1,0 +1,25 @@
+{
+    "name": "waiwaisew/minifier",
+    "description": "A php minifier code that minify JavaScript, trained by Claude AI",
+    "type": "library",
+    "license": "MIT",
+    "autoload": {
+        "psr-4": {
+            "Waiwaisew\\Minifier\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Waiwaisew\\Minifier\\Tests\\": "tests/"
+        }
+    },
+    "authors": [
+        {
+            "name": "WaiWaiSew"
+        }
+    ],
+    "minimum-stability": "stable",
+    "require-dev": {
+        "phpunit/phpunit": "^13.1"
+    }
+}
