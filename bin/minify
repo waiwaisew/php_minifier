@@ -1,0 +1,34 @@
+#!/usr/bin/env php
+<?php
+/* CLI: minify JavaScript files or stdin. */
+foreach ([__DIR__ . '/../vendor/autoload.php', __DIR__ . '/../../../autoload.php'] as $f) {
+    if (is_file($f)) { require $f; break; }
+}
+
+use Waiwaisew\Minifier\Minify;
+
+$args = array_slice($argv, 1);
+$mangle = true;
+$collapse = false;
+$paths = [];
+foreach ($args as $a) {
+    if ($a === '--no-mangle') { $mangle = false; continue; }
+    if ($a === '--collapse-inline') { $collapse = true; continue; }
+    if ($a === '-h' || $a === '--help') {
+        fwrite(STDERR, "Usage: minify [--no-mangle] [--collapse-inline] [file.js ...]\n"
+                     . "       cat file.js | minify\n");
+        exit(0);
+    }
+    $paths[] = $a;
+}
+try {
+    if ($paths) {
+        foreach ($paths as $p) echo Minify::file($p, $mangle, $collapse);
+    } else {
+        echo Minify::js((string)stream_get_contents(STDIN), $mangle, $collapse);
+    }
+} catch (\Throwable $ex) {
+    fwrite(STDERR, 'error: ' . $ex->getMessage() . "\n");
+    exit(1);
+}
+echo "\n";

@@ -1,9 +1,6 @@
 <?php
 namespace Waiwaisew\Minifier;
-/* =============================================================================
- * PART 2 – VARIABLE MANGLER
- * Renames local variables and parameters inside every function body.
- * ============================================================================= */
+
 /* =============================================================================
  * PART 2 – VARIABLE MANGLER
  * Renames local variables and parameters inside every function body.
@@ -130,6 +127,27 @@ class JsMangler
                 continue;
             }
 
+            // --- comment ---
+            // Must come before the regex branch: a banner such as
+            // `/*! lib | https://x.com/y */` otherwise reads as a regex that
+            // terminates at the first inner slash, and the rest of the comment
+            // is re-tokenised as code (spacing rewritten, `//` introduced).
+            if ($ch==='/' && ($code[$pos+1] ?? '') === '/') {
+                $s=$pos;
+                while ($pos<$len && $code[$pos] !== "\n") $pos++;
+                $tokens[] = ['t'=>'cmt','v'=>substr($code,$s,$pos-$s),'r'=>null];
+                continue;
+            }
+            if ($ch==='/' && ($code[$pos+1] ?? '') === '*') {
+                $s=$pos; $pos+=2;
+                while ($pos<$len) {
+                    if ($code[$pos]==='*' && ($code[$pos+1] ?? '')==='/') { $pos+=2; break; }
+                    $pos++;
+                }
+                $tokens[] = ['t'=>'cmt','v'=>substr($code,$s,$pos-$s),'r'=>null];
+                continue;
+            }
+
             // --- regex ---
             if ($ch==='/' && $this->isRegexCtx($tokens)) {
                 $s=$pos++;
@@ -189,6 +207,7 @@ class JsMangler
     {
         for ($i=count($tokens)-1;$i>=0;$i--) {
             $t=$tokens[$i];
+            if ($t['t']==='cmt') continue;   // a comment is not a value
             if ($t['t']==='kw') return in_array($t['v'],['return','typeof','instanceof','in','of','delete','void','throw','new','case','yield','await']);
             if (in_array($t['t'],['id','num'])) return false;
             if ($t['t']==='op') return !in_array($t['v'],[')',']','++','--']);
@@ -217,6 +236,12 @@ class JsMangler
                 continue;
             }
 
+            // Method shorthand:  m(){}  get v(){}  static m(){}  class methods
+            if ($t['t']==='id' && ($mp = $this->methodParenAt($i, $e)) !== null) {
+                $i = $this->handleMethod($i, $mp, $e, $outerMap);
+                continue;
+            }
+
             // Arrow function:  =>  followed by  {
             if ($t['t']==='op' && $t['v']=='=>') {
                 if (isset($this->tok[$i+1]) && $this->tok[$i+1]['v']==='{') {
@@ -228,11 +253,61 @@ class JsMangler
                     $i = $bodyEnd+1;
                     continue;
                 }
-                // Expression-body arrow — no block to mangle
+                // Expression-body arrow:  (a, b) => a + b
+                // It is a scope of its own. Treating it as part of the parent
+                // let an outer rename (lib -> p) land inside an arrow whose own
+                // parameter was already called `p`, so `(t, p) => lib.animate(t, p)`
+                // became `(t, p) => p.animate(t, p)` — the param shadowed it.
+                $bodyEnd = $this->arrowExprEnd($i+1, $e);
+                if ($bodyEnd >= $i+1) {
+                    $params    = $this->arrowParams($i);
+                    $renameMap = $this->mangleFunctionBody($i+1, $bodyEnd, $params, $outerMap);
+                    $this->applyMapToArrowSig($i, $renameMap);
+                    $i = $bodyEnd+1;
+                    continue;
+                }
             }
 
             $i++;
         }
+    }
+
+    /**
+     * If tokens[$i] starts a method shorthand — `name(params){` — return the
+     * index of its `(`, otherwise null.
+     *
+     * Control-flow headers (`if(...)  {`, `while(...) {`, `catch(e){`, ...) can
+     * never match because every one of those words tokenises as 'kw', not 'id'.
+     * The token in front must be one that legitimately precedes a method:
+     * `{` `}` `,` `;` `*`, or a get/set/static/async modifier.
+     */
+    private function methodParenAt(int $i, int $e): ?int
+    {
+        if (($this->tok[$i+1]['v'] ?? '') !== '(') return null;
+
+        $prev = $i > 0 ? $this->tok[$i-1] : null;
+        if ($prev === null) return null;
+        $pv = $prev['v'];
+        $ok = in_array($pv, ['{', '}', ',', ';', '*'], true)
+           || ($prev['t'] === 'kw' && in_array($pv, ['static', 'async', 'get', 'set'], true))
+           || ($prev['t'] === 'id' && in_array($pv, ['get', 'set'], true));
+        if (!$ok) return null;
+
+        $close = $this->matchParen($i+1, $e);
+        if (($this->tok[$close+1]['v'] ?? '') !== '{') return null;
+        return $i+1;
+    }
+
+    /** Mangle a method shorthand body and its parameter list. Returns index after it. */
+    private function handleMethod(int $nameI, int $paramOpen, int $e, array $outerMap): int
+    {
+        $closeP = $this->matchParen($paramOpen, $e);
+        $params = $this->collectParamsFromParen($paramOpen, $e);
+        $bodyI  = $closeP + 1;
+        $bodyEnd = $this->matchBrace($bodyI, $e);
+        $map = $this->mangleFunctionBody($bodyI+1, $bodyEnd-1, $params, $outerMap);
+        $this->applyMapToParenRange($paramOpen, $closeP, $map);
+        return $bodyEnd + 1;
     }
 
     /** Handle a `function` keyword token and its following body. */
@@ -345,27 +420,48 @@ class JsMangler
 
     /**
      * Collect parameter names from tokens[openParen..].
-     * Handles simple, rest, and basic destructured params.
+     * Handles simple, rest, destructured and defaulted params.
+     *
+     * Identifiers inside a default value are NOT parameters: in
+     * `(sel, scope = root) =>` the name `root` belongs to the enclosing scope.
+     * Collecting it made the arrow treat `root` as its own param and rename it
+     * to a fresh letter that was never declared (ReferenceError at runtime).
+     * A default starts at `=` and ends at the next `,` on the same depth or
+     * when its enclosing (, [ or { closes. Covers `{a = x}` and `[b = y]` too.
      */
     private function collectParamsFromParen(int $open, int $limit): array
     {
-        $params=[]; $depth=0; $i=$open;
-        while ($i<=$limit) {
-            $v=$this->tok[$i]['v']; $t=$this->tok[$i]['t'];
-            if (in_array($v,['(','[','{'])) $depth++;
-            elseif (in_array($v,[')',']','}'])) { $depth--; if ($depth===0) break; }
-            elseif ($t==='id') {
-                $prev = $i>0 ? $this->tok[$i-1]['v'] : '';
-                $next = $this->tok[$i+1]['v'] ?? '';
-                // Skip: property access, destructuring key (id followed by :)
-                if ($prev!=='.'&&$prev!=='?.'&&$next!==':') {
-                    $n=$this->tok[$i]['v'];
-                    if (!in_array($n,self::KW)&&!in_array($n,self::PROTECT)) $params[]=$n;
+        $params = [];
+        $depth = 0;
+        $defaultDepth = null;   // depth at which the current default value began
+
+        for ($i = $open; $i <= $limit; $i++) {
+            ['t' => $t, 'v' => $v] = $this->tok[$i];
+
+            if ($t === 'op') {
+                if (in_array($v, ['(', '[', '{'], true)) { $depth++; continue; }
+                if (in_array($v, [')', ']', '}'], true)) {
+                    if (--$depth === 0) break;
+                    if ($defaultDepth !== null && $depth < $defaultDepth) $defaultDepth = null;
+                    continue;
                 }
+                if ($v === '=' && $defaultDepth === null) { $defaultDepth = $depth; continue; }
+                if ($v === ',' && $depth === $defaultDepth) { $defaultDepth = null; }
+                continue;
             }
-            $i++;
+
+            if ($t !== 'id' || $defaultDepth !== null) continue;
+
+            $prev = $i > 0 ? $this->tok[$i - 1]['v'] : '';
+            $next = $this->tok[$i + 1]['v'] ?? '';
+            // Skip: property access, destructuring key (id followed by :)
+            if ($prev === '.' || $prev === '?.' || $next === ':') continue;
+            if (in_array($v, self::KW, true) || in_array($v, self::PROTECT, true)) continue;
+
+            $params[] = $v;
         }
-        return array_unique($params);
+
+        return array_values(array_unique($params));
     }
 
     // -------------------------------------------------------------------------
@@ -398,10 +494,13 @@ class JsMangler
         // Names that stay unchanged must not be used as short-name targets
         $notRenamed = array_values(array_diff($declared, $toRename));
 
-        // Only forbid outer short names for variables ACTUALLY referenced here.
-        // Outer variables not referenced in this scope are safe to reuse.
+        // Forbid ALL short names already allocated in any ancestor scope.
+        // $outerMap holds the merged original->short map for every ancestor,
+        // so array_values($outerMap) is the complete set of taken letters.
+        // This stops inner functions from reusing a,b,c... that parents use.
+        $ancestorShortNames = array_values($outerMap);
         $outerTaken = $this->outerRefsInScope($s, $e, $outerMap, $declared);
-        $forbidden  = array_merge($outerTaken, $notRenamed);
+        $forbidden  = array_unique(array_merge($ancestorShortNames, $outerTaken, $notRenamed));
 
         // Assign fresh short names — restart counter at 0 for every scope so
         // every function begins with a,b,c... where possible.
@@ -451,6 +550,13 @@ class JsMangler
                     $isBlock = $prevV === ')'
                         || $prevV === '=>'
                         || ($prevT === 'kw' && in_array($prevV, ['else','try','finally','do'], true));
+                    // A class body looks like an object literal but is not one:
+                    // `class A { x = 1 }` is a field, and rewriting it to the
+                    // shorthand form `x:a` would change it into a syntax error.
+                    if (!$isBlock && $this->isClassBodyBrace($i)) {
+                        $braceStack[] = 'class';
+                        continue;
+                    }
                     $braceStack[] = $isBlock ? 'block' : 'object';
                     continue;
                 }
@@ -498,6 +604,21 @@ class JsMangler
     }
 
     /**
+     * True when the `{` at $i opens a class body: walk back over the optional
+     * name and `extends Base` clause and look for the `class` keyword.
+     */
+    private function isClassBodyBrace(int $i): bool
+    {
+        for ($j = $i - 1; $j >= 0; $j--) {
+            $t = $this->tok[$j];
+            if ($t['t'] === 'id' || $t['v'] === '.') continue;
+            if ($t['t'] === 'kw' && $t['v'] === 'extends') continue;
+            return $t['t'] === 'kw' && $t['v'] === 'class';
+        }
+        return false;
+    }
+
+    /**
      * Scan tokens[s..e] for identifiers that reference outer-scope variables.
      * Returns the SET of short names (values in $outerMap) that are actually
      * used here — these must not be reused as new short names in this scope.
@@ -524,7 +645,10 @@ class JsMangler
             if ($tok['t']==='tmpl') {
                 foreach ($outerMap as $origName => $shortName) {
                     if (in_array($origName, $localDecl, true)) continue;
-                    if (strpos($tok['v'], $origName) !== false) {
+                    // Whole-word match: a plain strpos() made the name 'e' look
+                    // referenced by every template containing the letter e, which
+                    // needlessly burned short names.
+                    if (preg_match('/(?<![\w$])' . preg_quote($origName, '/') . '(?![\w$])/', $tok['v'])) {
                         $taken[] = $shortName;
                     }
                 }
@@ -619,6 +743,19 @@ class JsMangler
                 }
             }
 
+            // Local function declaration: `function helper(){}` / `function* g(){}`.
+            // The body itself is skipped above, so only the name is picked up here.
+            // Top-level code never reaches collectDeclarations(), so exported and
+            // globally-referenced functions keep their names.
+            if ($t['t']==='kw' && $t['v']==='function') {
+                $j = $i+1;
+                if ($j<=$e && $this->tok[$j]['v']==='*') $j++;
+                if ($j<=$e && $this->tok[$j]['t']==='id'
+                    && ($this->tok[$j+1]['v'] ?? '') === '(') {
+                    $decl[] = $this->tok[$j]['v'];
+                }
+            }
+
             // catch (err)
             if ($t['t']==='kw'&&$t['v']==='catch') {
                 if (isset($this->tok[$i+1])&&$this->tok[$i+1]['v']==='('
@@ -665,6 +802,20 @@ class JsMangler
                 $bodies[]=[$i+1,$be]; $i=$be+1; continue;
             }
 
+            // Expression-body arrow: its body is a nested scope too.
+            if ($t['t']==='op'&&$t['v']==='=>') {
+                $be=$this->arrowExprEnd($i+1,$e);
+                if ($be >= $i+1) { $bodies[]=[$i+1,$be]; $i=$be+1; continue; }
+            }
+
+            // Method shorthand bodies are scopes of their own, so their locals
+            // must not be collected as declarations of the enclosing scope.
+            if ($t['t']==='id' && ($mp = $this->methodParenAt($i, $e)) !== null) {
+                $bodyI = $this->matchParen($mp, $e) + 1;
+                $be    = $this->matchBrace($bodyI, $e);
+                $bodies[]=[$bodyI,$be]; $i=$be+1; continue;
+            }
+
             $i++;
         }
         return $bodies;
@@ -675,37 +826,163 @@ class JsMangler
     // -------------------------------------------------------------------------
 
     /**
-     * Apply $renameMap inside every ${...} expression of a template literal string.
-     * Leaves the HTML/text parts between expressions untouched.
+     * Apply $renameMap inside every ${...} expression of a template literal.
+     * Leaves the literal (HTML/text) parts untouched.
+     *
+     * IMPORTANT: the replacement is done in a SINGLE left-to-right pass over the
+     * expression. Looping preg_replace() over the map (the previous approach)
+     * chained substitutions: with a map like ['mn'=>'e', 'e'=>'s'] the text `mn`
+     * was rewritten to `e` by the first entry and then to `s` by the second, so
+     * `${mn}` silently became `${s}` — a different variable.
      */
     private function renameInTemplate(string $tpl, array $renameMap): string
     {
-        $out=''; $pos=0; $len=strlen($tpl);
-        while ($pos<$len) {
-            $start=strpos($tpl,'${',$pos);
-            if ($start===false) { $out.=substr($tpl,$pos); break; }
-            $out.=substr($tpl,$pos,$start-$pos);   // text before ${
+        if (empty($renameMap)) return $tpl;
 
-            // Find matching }
-            $depth=0; $j=$start+2;
-            while ($j<$len) {
-                if ($tpl[$j]==='{') $depth++;
-                elseif ($tpl[$j]==='}') { if($depth===0){break;} $depth--; }
-                $j++;
-            }
-            $expr=substr($tpl,$start+2,$j-$start-2);
+        $out = ''; $pos = 0; $len = strlen($tpl);
 
-            // Rename identifiers inside the expression
-            foreach ($renameMap as $old=>$new) {
-                $expr=preg_replace(
-                    '/(?<![a-zA-Z0-9_$])'.preg_quote($old,'/').'(?![a-zA-Z0-9_$])/',
-                    $new, $expr
-                );
+        while ($pos < $len) {
+            $ch = $tpl[$pos];
+
+            // Escape sequence in the literal part (covers \` and \${) — copy verbatim
+            if ($ch === '\\') { $out .= substr($tpl, $pos, 2); $pos += 2; continue; }
+
+            if ($ch === '$' && ($tpl[$pos + 1] ?? '') === '{') {
+                $end = $this->matchTplExprEnd($tpl, $pos + 2, $len);
+                if ($end < 0) { $out .= substr($tpl, $pos); break; }   // unterminated: leave as-is
+                $expr = substr($tpl, $pos + 2, $end - $pos - 2);
+                $out .= '${' . $this->renameInExpr($expr, $renameMap) . '}';
+                $pos  = $end + 1;
+                continue;
             }
 
-            $out.='${'.$expr.'}';
-            $pos=$j+1;
+            $out .= $ch; $pos++;
         }
+
+        return $out;
+    }
+
+    /**
+     * Index of the `}` that closes a ${ ... } expression starting at $pos,
+     * or -1 if unterminated. Strings and nested template literals are skipped so
+     * a brace inside them cannot end the expression.
+     */
+    private function matchTplExprEnd(string $s, int $pos, int $len): int
+    {
+        $depth = 0;
+        while ($pos < $len) {
+            $c = $s[$pos];
+            if ($c === '\\') { $pos += 2; continue; }
+            if ($c === "'" || $c === '"') { $pos = $this->skipQuoted($s, $pos, $len); continue; }
+            if ($c === '`')  { $pos = $this->skipTpl($s, $pos + 1, $len); continue; }
+            if ($c === '{')  { $depth++; $pos++; continue; }
+            if ($c === '}')  { if ($depth === 0) return $pos; $depth--; $pos++; continue; }
+            $pos++;
+        }
+        return -1;
+    }
+
+    /** Position just past the closing quote of the string starting at $pos. */
+    private function skipQuoted(string $s, int $pos, int $len): int
+    {
+        $q = $s[$pos]; $pos++;
+        while ($pos < $len) {
+            if ($s[$pos] === '\\') { $pos += 2; continue; }
+            if ($s[$pos] === $q)   { return $pos + 1; }
+            $pos++;
+        }
+        return $len;
+    }
+
+    /**
+     * Rename identifiers inside one ${ ... } expression, single pass.
+     * Skips: string contents, numeric literals (so the `e` in 1e5 is never an
+     * identifier), property names after `.` / `?.`, and object-literal keys.
+     * Nested template literals are recursed into so their own ${} are handled.
+     */
+    private function renameInExpr(string $expr, array $map): string
+    {
+        $out = ''; $i = 0; $n = strlen($expr); $prev = '';
+
+        while ($i < $n) {
+            $c = $expr[$i];
+
+            // --- string literal: copied verbatim ---
+            if ($c === "'" || $c === '"') {
+                $j = $this->skipQuoted($expr, $i, $n);
+                $out .= substr($expr, $i, $j - $i);
+                $i = $j; $prev = '"';
+                continue;
+            }
+
+            // --- nested template literal ---
+            if ($c === '`') {
+                $j = $this->skipTpl($expr, $i + 1, $n);
+                $out .= $this->renameInTemplate(substr($expr, $i, $j - $i), $map);
+                $i = $j; $prev = '`';
+                continue;
+            }
+
+            // --- numeric literal ---
+            if (ctype_digit($c) || ($c === '.' && ctype_digit($expr[$i + 1] ?? ''))) {
+                $s = $i;
+                $i++;
+                while ($i < $n && preg_match('/[0-9a-fA-FxXoObBnN._]/', $expr[$i])) {
+                    // exponent sign belongs to the number: 1e-5
+                    if (in_array($expr[$i], ['e', 'E'], true)
+                        && in_array($expr[$i + 1] ?? '', ['+', '-'], true)) { $i += 2; continue; }
+                    $i++;
+                }
+                $out .= substr($expr, $s, $i - $s);
+                $prev = '0';
+                continue;
+            }
+
+            // --- identifier ---
+            if (preg_match('/[A-Za-z_$]/', $c)) {
+                $s = $i;
+                while ($i < $n && preg_match('/[\w$]/', $expr[$i])) $i++;
+                $word = substr($expr, $s, $i - $s);
+
+                $k = $i; while ($k < $n && ctype_space($expr[$k])) $k++;
+                $next = $expr[$k] ?? '';
+
+                if (!isset($map[$word]) || $prev === '.') {
+                    $out .= $word;                       // unknown name, or obj.prop / obj?.prop
+                } elseif ($next === ':' && ($prev === '{' || $prev === ',')) {
+                    $out .= $word;                       // object-literal key: { key: value }
+                } elseif (($prev === '{' || $prev === ',')
+                          && in_array($next, ['}', ',', '='], true)) {
+                    $out .= $word . ':' . $map[$word];   // shorthand { name } -> { name: a }
+                } else {
+                    $out .= $map[$word];
+                }
+
+                $prev = 'w';
+                continue;
+            }
+
+            // --- spread / rest: `...name` is a value reference, NOT a property
+            // access. Consuming it as three separate '.' characters used to leave
+            // $prev === '.', so the identifier after it was skipped and kept its
+            // original (now undeclared) name.
+            if ($c === '.' && substr($expr, $i, 3) === '...') {
+                $out .= '...'; $i += 3; $prev = '...';
+                continue;
+            }
+
+            // --- optional chaining: `?.` behaves like `.` for the next word ---
+            if ($c === '?' && ($expr[$i + 1] ?? '') === '.'
+                && !ctype_digit($expr[$i + 2] ?? '')) {
+                $out .= '?.'; $i += 2; $prev = '.';
+                continue;
+            }
+
+            $out .= $c;
+            if (!ctype_space($c)) $prev = $c;
+            $i++;
+        }
+
         return $out;
     }
 
@@ -721,6 +998,35 @@ class JsMangler
             if ($v==='{') $d++; elseif ($v==='}') { $d--; if($d===0) return $i; }
         }
         return $limit;
+    }
+
+    /**
+     * Last token index of an arrow's expression body starting at $s.
+     * The body is an AssignmentExpression, so it ends at the first `,` `;`
+     * or unmatched closer at depth 0, or at a `:` that does not belong to a
+     * ternary opened inside the body. Returns $s-1 for an empty body.
+     */
+    private function arrowExprEnd(int $s, int $e): int
+    {
+        $depth = 0; $ternary = 0;
+        for ($k = $s; $k <= $e; $k++) {
+            $t = $this->tok[$k]; $v = $t['v'];
+            if ($t['t'] === 'cmt') return $k - 1;
+            if ($t['t'] !== 'op') continue;
+            if ($v === '(' || $v === '[' || $v === '{') { $depth++; continue; }
+            if ($v === ')' || $v === ']' || $v === '}') {
+                if ($depth === 0) return $k - 1;
+                $depth--; continue;
+            }
+            if ($depth > 0) continue;
+            if ($v === ',' || $v === ';') return $k - 1;
+            if ($v === '?') { $ternary++; continue; }
+            if ($v === ':') {
+                if ($ternary === 0) return $k - 1;
+                $ternary--;
+            }
+        }
+        return $e;
     }
 
     private function matchParen(int $open, int $limit): int
@@ -747,16 +1053,49 @@ class JsMangler
         foreach ($this->tok as $t) {
             $v = $t['r'] !== null ? $t['r'] : $t['v'];
             if ($v === '') continue;
-            // Re-add space between adjacent word tokens (identifiers, keywords, numbers)
-            if ($out !== '') {
-                $last  = substr($out, -1);
-                $first = $v[0];
-                if (preg_match('/[\w$]/', $last) && preg_match('/[\w$]/', $first)) {
-                    $out .= ' ';
-                }
+
+            // Comments are emitted verbatim on their own line. A line comment
+            // would otherwise swallow the code that follows it, and a block
+            // comment glued to the next token is hard to read.
+            if ($t['t'] === 'cmt') {
+                if ($out !== '' && !str_ends_with($out, "\n")) $out .= "\n";
+                $out .= $v . "\n";
+                continue;
             }
+
+            // Trailing comma before a closer is dead weight: `{a:1,}` -> `{a:1}`.
+            // Array holes must survive, so bail out when the previous character
+            // is itself a comma or the opening bracket.
+            if (($v === '}' || $v === ']' || $v === ')') && substr($out, -1) === ',') {
+                $before = substr($out, -2, 1);
+                if ($before !== ',' && $before !== '[') $out = substr($out, 0, -1);
+            }
+
+            // Separate tokens that would otherwise fuse (`a` `in` -> `ain`,
+            // `+` `+` -> `++`, `/` `/` -> a comment, ...).
+            if ($out !== '' && self::needsSeparator($out, $v[0])) $out .= ' ';
+
             $out .= $v;
         }
         return $out;
+    }
+
+    /** Mirrors JsMinifier::needsSeparator for the token-based rebuild. */
+    private static function needsSeparator(string $out, string $next): bool
+    {
+        $last    = substr($out, -1);
+        $lastTwo = substr($out, -2);
+
+        if (preg_match('/[\w$]/', $last) && preg_match('/[\w$]/', $next)) return true;
+        if ($last === '+' && $next === '+') return true;
+        if ($last === '-' && $next === '-') return true;
+        if ($last === '/' && ($next === '/' || $next === '*')) return true;
+        if ($last === '<' && $next === '!') return true;
+        if ($lastTwo === '--' && $next === '>') return true;
+        if ($next === '.' && ctype_digit($last)
+            && !preg_match('/[A-Za-z_$][\w$]*$/', $out)
+            && !preg_match('/\.[\d_]*$/', $out)) return true;
+
+        return false;
     }
 }

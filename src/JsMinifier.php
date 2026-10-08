@@ -1,6 +1,65 @@
 <?php
 namespace Waiwaisew\Minifier;
- 
+
+/* =============================================================================
+ * JavaScript Minifier + Variable Mangler
+ *
+ * Quick usage:
+ *   $out = Minify::js($code);              // minify + mangle
+ *   $out = Minify::js($code, false);       // minify only, keep names
+ *   $out = Minify::file('app.js');
+ *
+ * Low-level usage (unchanged, backwards compatible):
+ *   $min = (new JsMinifier())->minify($code);          // mangles by default
+ *   $min = (new JsMinifier())->minify($code, false);   // no mangling
+ *   $out = (new JsMangler())->mangle($min);
+ *
+ * CLI:
+ *   vendor/bin/minify app.js > app.min.js
+ *   vendor/bin/minify --no-mangle app.js
+ *   cat app.js | vendor/bin/minify
+ *
+ * -----------------------------------------------------------------------------
+ * CHANGELOG — correctness fixes
+ * -----------------------------------------------------------------------------
+ * [FIX] Identifiers in parameter default values were collected as params.
+ *       `(sel, scope = root) => …` renamed `root` to a fresh, undeclared
+ *       letter (`(w, x=y)`), a ReferenceError at runtime. Defaults are now
+ *       skipped by collectParamsFromParen() and keep the outer-scope rename.
+ * [FIX] Spread inside a template expression was not renamed.
+ *       `${fn({...group})}` kept `group` while the binding became `j`
+ *       (ReferenceError at runtime). renameInExpr() treated each `.` of `...`
+ *       as a member access. `...` and `?.` are now tokenised explicitly.
+ * [FIX] Adjacent operators could merge into a different token.
+ *       `a + +b` -> `a++b`, `a - -b` -> `a--b`, `a / /re/` -> `a//re/`
+ *       (comment!), `a < !--b` -> `a<!--b`. Both the whitespace collapser and
+ *       the newline joiner now consult needsSeparator().
+ * [FIX] Same merge hazard in JsMangler::reconstruct(), which rebuilds output
+ *       from tokens and only guarded word|word pairs.
+ * [FIX] `1 .toString()` no longer collapses to the invalid `1.toString()`.
+ * [FIX] Template HTML no longer loses meaningful spaces between inline
+ *       elements: `<b>a</b> <i>b</i>` kept its space, only newline
+ *       indentation is stripped. See $collapseInlineWhitespace to opt out.
+ * [FIX] Class fields (`class A { x = 1 }`) could be rewritten as shorthand
+ *       properties (`x:a`). Class bodies are now a distinct brace type.
+ * [FIX] License-comment detection misread `/**` as `/*!`; it now keeps `/*!`
+ *       and any comment carrying @license / @preserve.
+ *
+ * -----------------------------------------------------------------------------
+ * CHANGELOG — compression improvements
+ * -----------------------------------------------------------------------------
+ * [NEW] Method shorthand (`m(){}`, `get v(){}`, `static m(){}`, class methods)
+ *       is recognised as its own scope, so its params and locals mangle.
+ * [NEW] Local function declarations are renamed (`function helper(){}` inside
+ *       a function body). Top-level names are still left alone.
+ * [NEW] Trailing commas dropped: `{a:1,}` -> `{a:1}`, `f(x,)` -> `f(x)`.
+ *       Array holes (`[1,,]`) are preserved.
+ * ============================================================================= */
+
+
+/* =============================================================================
+ * PART 1 – MINIFIER
+ * ============================================================================= */
 class JsMinifier
 {
     private string $input  = '';
@@ -11,12 +70,31 @@ class JsMinifier
     private array  $braceStack     = [];
     private string $lastPoppedBrace = 'block';
 
+    /**
+     * When true, whitespace between inline HTML elements inside template
+     * literals is removed as well (`<b>a</b> <i>b</i>` -> `<b>a</b><i>b</i>`).
+     * That is smaller but visibly changes rendering, so it is off by default:
+     * only indentation whitespace (whitespace containing a newline) is removed.
+     */
+    public bool $collapseInlineWhitespace = false;
+
+    /** Set right after a preserved comment so the newline after it survives. */
+    private bool $keepNewlineAfterComment = false;
+
     private const PRESERVE_CONTENT_TAGS = ['pre', 'textarea', 'script', 'style'];
 
     private const CONTINUATION_KEYWORDS = [
-        'return', 'throw', 'case', 'typeof', 'instanceof', 'in',
+        'case', 'typeof', 'instanceof', 'in',
         'delete', 'void', 'new', 'var', 'let', 'const', 'else',
-        'extends', 'export', 'import', 'from', 'of', 'yield', 'await',
+        'extends', 'export', 'import', 'from', 'of', 'await',
+    ];
+
+    // ECMAScript "restricted productions": a LineTerminator immediately after
+    // one of these keywords forces Automatic Semicolon Insertion, so the
+    // statement ends at the newline. They must NEVER be joined with the next
+    // line (e.g. `return\nlet x=1` means `return; let x=1`, not `return let x=1`).
+    private const ASI_RESTRICTED_KEYWORDS = [
+        'return', 'throw', 'break', 'continue', 'yield',
     ];
 
     private const CONTROL_FLOW_KEYWORDS = [
@@ -41,7 +119,7 @@ class JsMinifier
 
     public function minifyFile(string $path, bool $mangle = true): string
     {
-        if (!file_exists($path)) throw new RuntimeException("File not found: $path");
+        if (!file_exists($path)) throw new \RuntimeException("File not found: $path");
         return $this->minify(file_get_contents($path), $mangle);
     }
 
@@ -59,8 +137,11 @@ class JsMinifier
                 $next = $this->input[$this->pos + 1] ?? '';
                 if ($next === '/') { $this->skipLineComment(); $this->handleNewline(); continue; }
                 if ($next === '*') {
-                    $lic = $this->isLicenseComment(); $c = $this->readBlockComment();
-                    if ($lic) $this->output .= $c . "\n";
+                    $c = $this->readBlockComment();
+                    if ($this->isLicenseComment($c)) {
+                        $this->output .= $c . "\n";
+                        $this->keepNewlineAfterComment = true;
+                    }
                     $this->skipWhitespaceInline(); continue;
                 }
                 if ($this->isRegexStart()) { $this->output .= $this->readRegex(); continue; }
@@ -81,6 +162,7 @@ class JsMinifier
                 $this->pos++; continue;
             }
             if ($ch === '}') {
+                $this->stripTrailingComma();
                 $poppedType = array_pop($this->braceStack) ?? 'block';
                 // Treat orphan as a block for semicolon-injection logic.
                 $this->lastPoppedBrace = ($poppedType === 'orphan') ? 'block' : $poppedType;
@@ -93,6 +175,8 @@ class JsMinifier
                 }
                 $this->pos++; continue;
             }
+
+            if ($ch === ']' || $ch === ')') $this->stripTrailingComma();
 
             $this->output .= $ch; $this->pos++;
         }
@@ -157,8 +241,26 @@ class JsMinifier
 
     private function handleNewline(): void
     {
+        $this->handleNewlineInner();
+        // The join above may have butted two operators together (`a +` + `+b`).
+        $next = $this->peekNonWhitespace();
+        if ($next !== '' && $this->needsSeparator($this->output, $next)) {
+            $this->output .= ' ';
+        }
+    }
+
+    private function handleNewlineInner(): void
+    {
         while ($this->pos < $this->length &&
                in_array($this->input[$this->pos], ["\n","\r",' ',"\t"], true)) $this->pos++;
+
+        // A preserved /*! ... */ banner keeps its line break, otherwise the
+        // rtrim() below would glue the next statement onto the comment.
+        if ($this->keepNewlineAfterComment) {
+            $this->keepNewlineAfterComment = false;
+            $this->output = rtrim($this->output) . "\n";
+            return;
+        }
 
         $out  = rtrim($this->output);
         $next = $this->peekNonWhitespace();
@@ -167,6 +269,16 @@ class JsMinifier
         $lastChar = substr($out, -1);
 
         if (in_array($lastChar, [';','{',',','(','[',':','\\'], true)) { $this->output = $out; return; }
+
+        // ASI restricted productions: statement ends at the newline, no matter
+        // what follows. Checked FIRST (before any lookahead-based joins) so that
+        // e.g. `return\n(fn())` is not turned into `return(fn())`.
+        $lw = $this->lastWord($out);
+        if (in_array($lw, self::ASI_RESTRICTED_KEYWORDS, true)) {
+            // Make sure it's the keyword itself, not a property access like `gen.return`
+            $prevChar = substr(rtrim(substr($out, 0, strlen($out) - strlen($lw))), -1);
+            if ($prevChar !== '.') { $this->output = $out . ';'; return; }
+        }
 
         if ($lastChar === '}') {
             if ($next !== '' && in_array($next, ['.','?',':','(',',',')',']','{','}'], true)) { $this->output = $out; return; }
@@ -239,21 +351,56 @@ class JsMinifier
 
     private function readTemplateLiteral(): string
     {
-        $this->pos++; $result = '`'; $htmlChunk = '';
+        $this->pos++; $result = '`'; $htmlChunk = ''; $afterExpr = false;
         while ($this->pos < $this->length) {
             $ch = $this->input[$this->pos];
             if ($ch === '\\') { $htmlChunk .= $ch.($this->input[$this->pos+1]??''); $this->pos+=2; continue; }
             if ($ch === '$' && ($this->input[$this->pos+1]??'') === '{') {
-                $trailing = strlen($htmlChunk) > 0 && ctype_space(substr($htmlChunk,-1));
-                $m = $this->minifyHtmlChunk($htmlChunk);
-                $result .= $trailing ? rtrim($m).' ' : $m;
+                $result .= $this->emitChunk($htmlChunk, $afterExpr, true);
                 $htmlChunk = ''; $result .= '${'; $this->pos += 2;
-                $result .= $this->readTemplateExpression(); continue;
+                $result .= $this->readTemplateExpression();
+                $afterExpr = true; continue;
             }
-            if ($ch === '`') { $result .= $this->minifyHtmlChunk($htmlChunk).'`'; $this->pos++; break; }
+            if ($ch === '`') {
+                $result .= $this->emitChunk($htmlChunk, $afterExpr, false).'`';
+                $this->pos++; break;
+            }
             $htmlChunk .= $ch; $this->pos++;
         }
         return $result;
+    }
+
+    /**
+     * Minify one literal chunk of a template and decide what happens to the
+     * whitespace touching an adjacent `${...}`.
+     *
+     * A deliberate space (`</b> ${x} <i>`) is meaningful in HTML and is kept;
+     * whitespace that contains a newline is source indentation and is dropped.
+     * Both edges are treated the same way — previously the trailing edge kept
+     * any whitespace and the leading edge was always trimmed, so
+     * `${price} <b>x</b>` silently lost its space and rendered as one word.
+     */
+    private function emitChunk(string $chunk, bool $afterExpr, bool $beforeExpr): string
+    {
+        if ($chunk === '') return '';
+
+        $keepLead  = $afterExpr  && $this->edgeSpaceSurvives($chunk, true);
+        $keepTrail = $beforeExpr && $this->edgeSpaceSurvives($chunk, false);
+
+        $min = trim($this->minifyHtmlChunk($chunk));
+        if ($min === '') return ($keepLead || $keepTrail) ? ' ' : '';
+
+        return ($keepLead ? ' ' : '') . $min . ($keepTrail ? ' ' : '');
+    }
+
+    /** A single space at this edge is deliberate (no newline in the run of whitespace). */
+    private function edgeSpaceSurvives(string $chunk, bool $leading): bool
+    {
+        if ($this->collapseInlineWhitespace) return false;
+        $ws = $leading
+            ? substr($chunk, 0, strlen($chunk) - strlen(ltrim($chunk)))
+            : substr($chunk, strlen(rtrim($chunk)));
+        return $ws !== '' && strpbrk($ws, "\r\n") === false;
     }
 
     private function readTemplateExpression(): string
@@ -283,7 +430,14 @@ class JsMinifier
                 function($m) use (&$ph,&$idx){ $k="\x00P{$idx}\x00"; $ph[$k]=$m[0]; $idx++; return $k; }, $html);
         }
         $html = preg_replace('/<!--(?!\[if\s)[\s\S]*?-->/i','', $html);
-        $html = preg_replace('/>\s+</', '><', $html);
+        // Whitespace between tags: indentation (contains a newline) is noise and
+        // is removed; a deliberate single space between inline elements is kept
+        // because dropping it visibly joins words.
+        $html = $this->collapseInlineWhitespace
+            ? preg_replace('/>\s+</', '><', $html)
+            : preg_replace_callback('/>[ \t\r\n]+</',
+                static fn($m) => strpbrk($m[0], "\r\n") !== false ? '><' : '> <',
+                $html);
         $html = preg_replace('/[ \t\r\n]{2,}/', ' ', $html);
         $html = preg_replace_callback('/<[^>]+>/', static fn($m)=>preg_replace('/\s{2,}/',' ',trim($m[0])), $html);
         foreach ($ph as $k=>$v) $html = str_replace($k,$v,$html);
@@ -295,8 +449,12 @@ class JsMinifier
     private function skipLineComment(): void
     { while ($this->pos < $this->length && $this->input[$this->pos] !== "\n") $this->pos++; }
 
-    private function isLicenseComment(): bool
-    { return isset($this->input[$this->pos+2]) && ($this->input[$this->pos+2]==='!'||(isset($this->input[$this->pos+3])&&$this->input[$this->pos+3]==='*')); }
+    /** Keep `/*!` banners and anything marked @license / @preserve. */
+    private function isLicenseComment(string $comment): bool
+    {
+        if (str_starts_with($comment, '/*!')) return true;
+        return (bool)preg_match('/@(?:license|preserve|cc_on)\b/i', $comment);
+    }
 
     private function readBlockComment(): string
     {
@@ -342,8 +500,59 @@ class JsMinifier
     {
         $out=$this->output; $next=$this->peekNonWhitespace();
         if ($out===''||$next==='') return false;
-        $last=substr($out,-1);
-        return preg_match('/[\w$_]/',$last)&&preg_match('/[\w$_]/',$next);
+        return $this->needsSeparator($out,$next);
+    }
+
+    /**
+     * True when removing the whitespace between $out and $next would fuse two
+     * tokens into a single, different one. Covers word|word (`let x`) plus the
+     * operator pairs that silently change meaning:
+     *
+     *   a + +b   -> a++b     (postfix increment, then a stray identifier)
+     *   a - -b   -> a--b
+     *   a / /r/  -> a//r/    (line comment — the rest of the line vanishes)
+     *   a / * b  -> a/*b     (block comment)
+     *   a < !--b -> a<!--b   (Annex B html-open comment)
+     *   a-- > b  -> a-->b    (Annex B html-close comment)
+     *   1 .toFixed() -> 1.toFixed()   (syntax error)
+     */
+    private function needsSeparator(string $out, string $next): bool
+    {
+        if ($out === '' || $next === '') return false;
+        $last    = substr($out, -1);
+        $lastTwo = substr($out, -2);
+        $isWord  = static fn(string $c): bool => (bool)preg_match('/[\w$]/', $c);
+
+        if ($isWord($last) && $isWord($next)) {
+            // Numeric literal followed by `.` is handled below, not here.
+            return true;
+        }
+        if ($last === '+' && $next === '+') return true;
+        if ($last === '-' && $next === '-') return true;
+        if ($last === '/' && ($next === '/' || $next === '*')) return true;
+        if ($last === '<' && $next === '!') return true;
+        if ($lastTwo === '--' && $next === '>') return true;
+
+        // `1 .toString()` is legal; `1.toString()` is not. Only guard when the
+        // trailing digits really are a number literal, not the tail of a name.
+        if ($next === '.' && ctype_digit($last)
+            && !preg_match('/[A-Za-z_$][\w$]*$/', $out)
+            && !preg_match('/\.[\d_]*$/', $out)) return true;
+
+        return false;
+    }
+
+    /**
+     * Drop a trailing comma that is about to be closed by } ] or ).
+     * Array holes are preserved: `[1,,]` and `[,]` keep their commas.
+     */
+    private function stripTrailingComma(): void
+    {
+        $out = rtrim($this->output);
+        if (substr($out, -1) !== ',') return;
+        $before = substr($out, -2, 1);
+        if ($before === ',' || $before === '[') return;
+        $this->output = substr($out, 0, -1);
     }
 
     private function peekNonWhitespace(): string

@@ -13,6 +13,9 @@
             "Waiwaisew\\Minifier\\Tests\\": "tests/"
         }
     },
+    "bin": [
+        "bin/minify"
+    ],
     "authors": [
         {
             "name": "WaiWaiSew"

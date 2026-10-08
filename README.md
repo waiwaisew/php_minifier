@@ -24,6 +24,22 @@ $min  = (new Waiwaisew/JsMinifier())->minify($javascript_text);
 $min  = (new Waiwaisew/JsMinifier())->minify($javascript_text, false);
 ```
 
+**Facade:**<br>
+```php
+use Waiwaisew\Minifier\Minify;
+
+$min = Minify::js($javascript_text);          // minify + mangle
+$min = Minify::js($javascript_text, false);   // minify only
+$min = Minify::file('app.js');
+Minify::toFile('app.js', 'app.min.js');
+```
+**Command line:**<br>
+```bash
+vendor/bin/minify app.js > app.min.js
+vendor/bin/minify --no-mangle app.js
+cat app.js | vendor/bin/minify
+```
+
 ## Others
 1. This package is generated using Claude AI.
 2. The code will be improved base on what creator face time by time.
